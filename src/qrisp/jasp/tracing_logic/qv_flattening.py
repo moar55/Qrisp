@@ -46,7 +46,11 @@ class QuantumVariableTemplate:
     def __init__(self, qv, size_tracked=True):
         self.duplication_counter = 0
         self.qv = copy.copy(qv)
-        self.qv.reg = None
+        # This copy is only a carrier of type information: nothing reads its register or
+        # session -- `flatten_template` and `construct` use only the name and the traced
+        # attributes, and `construct` registers each copy it hands out. The session goes
+        # along with the register because a binding is all-or-nothing.
+        self.qv.unbind()
         self.size_tracked = size_tracked
         self.qv_size = None
         if size_tracked:
@@ -57,6 +61,15 @@ class QuantumVariableTemplate:
         res.name = self.qv.name + "duplicate_" + str(self.duplication_counter)
         self.duplication_counter += 1
 
+        if reg is not None:
+            # Registering is the caller's job: this is the unflatten path, and the scope
+            # that will own the variable has not been established yet.
+            res.reg = reg
+            return res
+
+        if not self.size_tracked or self.qv_size is None:
+            raise Exception("Tried to construct QuantumVariable from template lacking a size specification")
+
         if check_for_tracing_mode():
             qs = TracingQuantumSession.get_instance()
         else:
@@ -64,14 +77,7 @@ class QuantumVariableTemplate:
 
             qs = QuantumSession()
 
-        res.qs = qs
-        if reg is None:
-            if not self.size_tracked:
-                raise Exception("Tried to construct QuantumVariable from template lacking a size specification")
-
-            qs.register_qv(res, self.qv_size)
-        else:
-            res.reg = reg
+        qs.register_qv(res, self.qv_size)
         return res
 
     def __hash__(self):
@@ -113,10 +119,11 @@ def unflatten_qv(aux_data, children):
     reg = DynamicQubitArray(children[0])
     qv = qv_container.construct(reg)
 
-    # We set the QuantumSession to None because the QuantumVariable needs
-    # to be registered into the TracingQuantumSession of the new tracing
-    # context manually.
-    qv.qs = None
+    # `construct` left the register set but the session unbound: JAX unflattens a carry
+    # *before* the receiving scope calls `start_tracing`, so only the code owning the
+    # boundary knows which session this belongs to. It must `register_qv` the result --
+    # see `qaching.py`, `centerclass.py` and `prefix_control.py`. Skipping that surfaces
+    # later, as "is not registered in a QuantumSession" at the first gate applied.
 
     for i in range(len(qv.traced_attributes)):
         setattr(qv, qv.traced_attributes[i], children[i + 1])

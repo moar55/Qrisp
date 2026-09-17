@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 from weakref import ReferenceType
 
@@ -29,36 +30,77 @@ from jax import tree_util
 from qrisp.core.compilation import qompiler
 
 if TYPE_CHECKING:
+    from typing import TypeAlias
+
+    from typing_extensions import TypeIs
+
+    from qrisp.circuit import Qubit
     from qrisp.core.quantum_session import QuantumSession
     from qrisp.interface.measurement_result import DecodedMeasurementResult
-    from qrisp.jasp import TracingQuantumSession
+    from qrisp.jasp import DynamicQubitArray, TracingQuantumSession
+
+    Register: TypeAlias = list[Qubit] | DynamicQubitArray
+    Session: TypeAlias = QuantumSession | TracingQuantumSession
 
 
-def extract_quantum_session(qs: QuantumSession | None) -> QuantumSession | TracingQuantumSession:
-    """Determine the QuantumSession a new QuantumVariable should be registered in.
+@dataclass(frozen=True)
+class TracedBinding:
+    """A QuantumVariable's session and register while tracing."""
 
-    While tracing (e.g. within jasp), the active :class:`TracingQuantumSession`
-    is always used, regardless of ``qs``. Otherwise, ``qs`` is used if given, and
-    a fresh :class:`QuantumSession` is created if not.
+    qs: TracingQuantumSession
+    reg: DynamicQubitArray
 
-    Parameters
-    ----------
-    qs : QuantumSession, optional
-        A QuantumSession object to extract from, if provided, in non-tracing mode.
-        The default is None.
 
-    Returns
-    -------
-    QuantumSession or TracingQuantumSession
-        The QuantumSession to register the new QuantumVariable in.
+@dataclass(frozen=True)
+class StaticBinding:
+    """A QuantumVariable's session and register outside of tracing."""
+
+    qs: QuantumSession
+    reg: list[Qubit]
+
+
+@dataclass(frozen=True)
+class PendingBinding:
+    """A register whose session is not yet known.
+
+    Produced when a QuantumVariable crosses a JAX pytree boundary: unflattening rebuilds
+    the register, but the session depends on which scope receives it, and that isn't known
+    at unflatten time.
+    ``register_qv`` promotes this to a :class:`TracedBinding` or :class:`StaticBinding`.
+    """
+
+    reg: Register
+
+
+if TYPE_CHECKING:
+    Binding: TypeAlias = TracedBinding | StaticBinding | PendingBinding
+
+
+def _make_binding(qs: Session, reg: Register) -> TracedBinding | StaticBinding:
+    """Pair *qs* with *reg*, choosing the binding that matches their kind.
+
+    A QuantumVariable in a tracing context carries a
+    :class:`~qrisp.jasp.DynamicQubitArray`, and outside of tracing a plain list of
+    :class:`~qrisp.circuit.Qubit`.
+    Because the two bindings (TracedBinding and StaticBinding) fix that correspondence in
+    their field types, a mismatched pair cannot be represented.
+
+    Raises
+    ------
+    TypeError
+        If *reg* is not the kind of register *qs* uses.
 
     """
-    from qrisp.core.quantum_session import QuantumSession
-    from qrisp.jasp import TracingQuantumSession, check_for_tracing_mode
+    from qrisp.jasp import DynamicQubitArray, TracingQuantumSession
 
-    if check_for_tracing_mode():
-        return TracingQuantumSession.get_instance()
-    return qs or QuantumSession()
+    if isinstance(qs, TracingQuantumSession):
+        if not isinstance(reg, DynamicQubitArray):
+            raise TypeError(f"A tracing QuantumSession requires a DynamicQubitArray register, got {type(reg).__name__}")
+        return TracedBinding(qs, reg)
+
+    if not isinstance(reg, list):
+        raise TypeError(f"A QuantumSession requires a list of qubits as register, got {type(reg).__name__}")
+    return StaticBinding(qs, reg)
 
 
 class QuantumVariable:
@@ -246,14 +288,19 @@ class QuantumVariable:
     name: str
     # Whether `name` is fixed and can't be renamed, mainly for static
     # QuantumSessions.
-    # See `generate_name` `resolve_naming_collisions` in session_merging_tools.py.
+    # See `resolve_naming_collisions` in session_merging_tools.py.
     is_fixed_name: bool
-    reg: Any  # pyright: ignore[reportExplicitAny, reportUninitializedInstanceVariable]
-    creation_time: int  # pyright: ignore[reportUninitializedInstanceVariable]
+    # Backing storage for the `reg`/`qs` properties.
+    # Assigned by the relevant setters of `reg` and `qs`, and by the bind method.
+    # The session and register move as one value: see `_make_binding`.
+    # None until the variable is bound.
+    _binding: Binding | None = None
+    # Assigned by QuantumSession.register_qv.
+    # -1 until the variable is registered.
+    creation_time: int = -1
     live_qvs: list[ReferenceType[Self]] = []
     creation_counter: int = 0
     name_tracker: dict[str, int] = {}
-    qs: QuantumSession | TracingQuantumSession
     static_attributes: list[str]
     traced_attributes: list[str]
 
@@ -297,17 +344,19 @@ class QuantumVariable:
         # Specify the static attributes (empty for base type QuantumVariable)
         self.static_attributes = []
 
-        # Store quantum session
-        self.qs = extract_quantum_session(qs)
-
         from qrisp.core.quantum_session import QuantumSession
+        from qrisp.jasp import TracingQuantumSession, check_for_tracing_mode
 
-        if isinstance(self.qs, QuantumSession):
+        # Store quantum session
+        session = TracingQuantumSession.get_instance() if check_for_tracing_mode() else qs or QuantumSession()
+
+        if isinstance(session, QuantumSession):
             declaration_stack_level = 1 if type(self) is QuantumVariable else 2
-            (self.name, self.is_fixed_name) = self.qs.generate_name(name, self, declaration_stack_level + 1)
+            (self.name, self.is_fixed_name) = session.generate_name(name, self, declaration_stack_level + 1)
         else:
             self.name = name if name is not None else self.get_unique_name()
-        self.qs.register_qv(self, size)
+
+        session.register_qv(self, size)
 
         from qrisp.jasp.tracing_logic import flatten_qv, unflatten_qv
 
@@ -319,6 +368,53 @@ class QuantumVariable:
             tree_util.register_pytree_node(type(self), flatten_qv, unflatten_qv)
         except ValueError:
             pass
+
+    @classmethod
+    def _next_creation_time(cls) -> int:
+        """Hand out the next creation time, used to order QuantumVariables by age."""
+        creation_time = QuantumVariable.creation_counter
+        QuantumVariable.creation_counter += 1
+        return creation_time
+
+    def bind(self, qs: Session, reg: Register | None = None) -> None:
+        """Bind this QuantumVariable to *qs*, keeping its register unless *reg* is given."""
+        self._binding = _make_binding(qs, self.reg if reg is None else reg)
+
+    def unbind(self) -> None:
+        """Drop both session and register, leaving the quantum variable unusable until rebound.
+
+        Used by :class:`~qrisp.jasp.QuantumVariableTemplate`, which keeps a QuantumVariable
+        purely as a carrier of type information.
+        Reading ``.reg`` or ``.qs`` raises until the variable is bound again.
+        """
+        self._binding = None
+
+    @property
+    def reg(self) -> Register:
+        """The qubits this QuantumVariable consists of."""
+        if self._binding is None:
+            raise TypeError(f"QuantumVariable {self.name} has no register assigned")
+        return self._binding.reg
+
+    @reg.setter
+    def reg(self, value: Register) -> None:
+        if isinstance(self._binding, (TracedBinding, StaticBinding)):
+            self._binding = _make_binding(self._binding.qs, value)
+        else:
+            self._binding = PendingBinding(value)
+
+    @property
+    def qs(self) -> Session:
+        """The QuantumSession this QuantumVariable is registered in."""
+        if not isinstance(self._binding, (TracedBinding, StaticBinding)):
+            raise TypeError(f"QuantumVariable {self.name} is not registered in a QuantumSession")
+        return self._binding.qs
+
+    @qs.setter
+    def qs(self, value: Session) -> None:
+        if self._binding is None:
+            raise TypeError(f"QuantumVariable {self.name} has no register to bind to a QuantumSession")
+        self._binding = _make_binding(value, self._binding.reg)
 
     def __or__(self, other):
         from qrisp import cx, mcx, x
@@ -433,9 +529,7 @@ class QuantumVariable:
         Exception: Tried to perform operation x on unallocated qubit qv_1.0.
 
         """
-        from qrisp.jasp import TracingQuantumSession
-
-        if not isinstance(self.qs, TracingQuantumSession) and self.is_deleted():
+        if is_static(self) and self.is_deleted():
             return
 
         self.qs.delete_qv(self, verify)
@@ -457,10 +551,14 @@ class QuantumVariable:
             i += 1
 
         if recompute:
+            if not is_static(self):
+                raise Exception("Tried to mark a QuantumVariable for recomputation in tracing mode")
             for qb in self.reg:
                 qb.recompute = True
 
     def is_deleted(self):
+        if not is_static(self):
+            raise Exception("Tried to query the deletion status of a QuantumVariable in tracing mode")
         for qb in self.reg:
             if not qb.allocated:
                 return True
@@ -517,12 +615,10 @@ class QuantumVariable:
         new_qs = TracingQuantumSession.get_instance() if check_for_tracing_mode() else QuantumSession()
 
         duplicate = copy.copy(self)
+        duplicate._binding = None
 
         if qubits is not None:
-            duplicate.reg = qubits
-            size = None
-        else:
-            size = self.size
+            duplicate._binding = PendingBinding(qubits)
 
         # Set name of duplicate variable.
         if isinstance(new_qs, QuantumSession):
@@ -538,11 +634,10 @@ class QuantumVariable:
             duplicate.is_fixed_name = False
 
         # Register duplicate variable in session.
-        new_qs.register_qv(duplicate, size)
+        new_qs.register_qv(duplicate, None if qubits is not None else self.size)
 
         from qrisp import merge
 
-        duplicate.qs = new_qs
         if qs is not None and isinstance(qs, QuantumSession):
             merge(qs, new_qs)
 
@@ -838,10 +933,8 @@ class QuantumVariable:
         [Qubit(qv.0), Qubit(qv.1), Qubit(qv.2), Qubit(qv.6), Qubit(qv.6), Qubit(qv.6)]
 
         """
-        insertion_qubits = self.qs.request_qubits(amount)
-        from qrisp.jasp import check_for_tracing_mode
-
-        if check_for_tracing_mode():
+        if is_traced(self):
+            insertion_qubits = self.qs.request_qubits(amount)
             if isinstance(position, int) and position in [0, -1]:
                 if position == -1:
                     self.reg = self.reg + insertion_qubits
@@ -849,13 +942,14 @@ class QuantumVariable:
                     self.reg = insertion_qubits + self.reg
             else:
                 self.reg = self.reg[:position] + insertion_qubits + self.reg[position:]
-        else:
+        elif is_static(self):
+            insertion_qubits = self.qs.request_qubits(amount)
             if position == -1:
                 position = self.size
 
             for i in range(amount):
-                insertion_qubits[i].identifier = (  # pyright: ignore
-                    self.name + "_ext_" + str(self.qs.qubit_index_counter[0]) + "." + str(self.size)  # pyright: ignore
+                insertion_qubits[i].identifier = (
+                    self.name + "_ext_" + str(self.qs.qubit_index_counter[0]) + "." + str(self.size)
                 )
                 self.reg.insert(position + i, insertion_qubits[i])
 
@@ -893,6 +987,9 @@ class QuantumVariable:
         [Qubit(qv.2), Qubit(qv.3), Qubit(qv.4)]
 
         """
+        if not is_static(self):
+            raise Exception("Tried to reduce a QuantumVariable in tracing mode")
+
         try:
             len(qubits)
         except TypeError:
@@ -905,8 +1002,8 @@ class QuantumVariable:
         for i in range(len(qubits)):
             for j in range(self.size):
                 if self.reg[j] == qubits[i]:
-                    self.reg[j].identifier = "reduced_" + str(self.qs.qubit_index_counter[0])  # pyright: ignore
-                    self.qs.qubit_index_counter += 1  # pyright: ignore
+                    self.reg[j].identifier = "reduced_" + str(self.qs.qubit_index_counter[0])
+                    self.qs.qubit_index_counter += 1
                     self.reg.pop(j)
                     break
 
@@ -989,10 +1086,8 @@ class QuantumVariable:
         {1.0: 0.5, 3.0: 0.5}
 
         """
-        from qrisp.jasp import TracingQuantumSession
-
-        if isinstance(self.qs, TracingQuantumSession):
-            raise Exception("Tried to get measurement of a QuantumVariable in tracing mode")
+        if not is_static(self):
+            raise Exception("get_measurement() is not available while tracing, use QuantumVariable.measure() instead")
 
         if backend is None:
             if self.qs.backend is None:
@@ -1110,10 +1205,11 @@ class QuantumVariable:
 
     @property
     def size(self):
-        if isinstance(self.reg, list):
-            return len(self.reg)
-        else:
+        if is_traced(self):
             return self.reg.size
+        if is_static(self):
+            return len(self.reg)
+        raise TypeError(f"QuantumVariable {self.name} is not registered in a QuantumSession")
 
     # Overload equality operator to use python syntax for if environments?
     # Not sure if the possible user confusion is worth it
@@ -1385,13 +1481,11 @@ class QuantumVariable:
 
 
         """
+        if not is_static(self):
+            raise Exception("Tried to uncompute a QuantumVariable in tracing mode")
+
         if self.is_deleted():
             raise Exception("Tried to uncompute deleted QuantumVariable")
-
-        from qrisp.jasp import TracingQuantumSession
-
-        if isinstance(self.qs, TracingQuantumSession):
-            raise Exception("Tried to uncompute a QuantumVariable in tracing mode")
 
         if do_it:
             from qrisp.permeability import uncompute
@@ -1438,10 +1532,9 @@ class QuantumVariable:
         return name
 
     def __iter__(self):
-        if not isinstance(self.reg, list):
+        if not is_static(self):
             raise Exception("Tried to perform a static iteration on a dynamic QuantumVariable")
-        else:
-            return self.reg.__iter__()
+        return self.reg.__iter__()
 
     def init_from(self, other):
         r"""Initializes a QuantumVariable based on the state of another.
@@ -1514,10 +1607,9 @@ class QuantumVariable:
         if not type(self) == type(other):
             raise Exception("Tried to initialize " + str(type(self)) + " from " + str(type(other)))
 
-        from qrisp.jasp import TracingQuantumSession
         from qrisp.misc import check_if_fresh
 
-        if isinstance(self.qs, TracingQuantumSession):
+        if not (is_static(self) and is_static(other)):
             raise Exception("Tried to initialize a QuantumVariable from another in tracing mode")
 
         if not check_if_fresh(self.reg, self.qs):
@@ -1573,6 +1665,8 @@ class QuantumVariable:
         return self.reg
 
     def measure(self):
+        if not is_traced(self):
+            raise Exception("measure() is only available while tracing, use QuantumVariable.get_measurement() instead")
         return self.jdecoder(self.reg.measure())
 
     def template(self):
@@ -1599,3 +1693,54 @@ def plot_histogram(outcome_labels, counts, filename=None):
         plt.savefig(filename, dpi=400, bbox_inches="tight")
     else:
         plt.show()
+
+
+if TYPE_CHECKING:
+    # Never instantiated - these exist only so that `is_traced`/`is_static` have
+    # something to narrow a QuantumVariable to.
+    # They restate `reg` and `qs` as the kind they actually have.
+    class TracedQuantumVariable(QuantumVariable):
+        """A QuantumVariable inside a tracing context. Type-checking only."""
+
+        @property
+        def reg(self) -> DynamicQubitArray:
+            """The qubits this QuantumVariable consists of."""
+            ...
+
+        @reg.setter
+        def reg(self, value: Register) -> None: ...
+        @property
+        def qs(self) -> TracingQuantumSession:
+            """The QuantumSession this QuantumVariable is registered in."""
+            ...
+
+        @qs.setter
+        def qs(self, value: Session) -> None: ...
+
+    class StaticQuantumVariable(QuantumVariable):
+        """A QuantumVariable outside of any tracing context. Type-checking only."""
+
+        @property
+        def reg(self) -> list[Qubit]:
+            """The qubits this QuantumVariable consists of."""
+            ...
+
+        @reg.setter
+        def reg(self, value: Register) -> None: ...
+        @property
+        def qs(self) -> QuantumSession:
+            """The QuantumSession this QuantumVariable is registered in."""
+            ...
+
+        @qs.setter
+        def qs(self, value: Session) -> None: ...
+
+
+def is_traced(qv: QuantumVariable) -> TypeIs[TracedQuantumVariable]:
+    """Check whether a QuantumVariable lives in a tracing session, narrowing its register type."""
+    return isinstance(qv._binding, TracedBinding)
+
+
+def is_static(qv: QuantumVariable) -> TypeIs[StaticQuantumVariable]:
+    """Check whether a QuantumVariable lives in a non-tracing session, narrowing its register type."""
+    return isinstance(qv._binding, StaticBinding)

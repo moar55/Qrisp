@@ -210,19 +210,21 @@ class TracingQuantumSession:
 
         self.abs_qst = quantum_gate_p.bind(*qubits, *param_tracers, self.abs_qst, gate=operation)
 
-    def register_qv(self, qv: QuantumVariable, size: int | Tracer | None) -> None:
-        """Register a quantum variable in this session and optionally allocate qubits.
+    def register_qv(self, qv: QuantumVariable, size: int | Tracer | None = None) -> None:
+        """Register *qv* in this session, allocating *size* qubits if it has none yet.
+
+        Every path that produces a usable QuantumVariable goes through here: construction,
+        duplication, and re-registration of a variable that came back from a JAX pytree
+        boundary with its register intact. Pass *size* only in the first case.
 
         Parameters
         ----------
         qv : QuantumVariable
             The quantum variable to register.
-        size : int or jax.core.Tracer or None
-            Number of qubits to allocate. If ``None``, no allocation is performed
-            (the variable already has qubits assigned).
+        size : int or jax.core.Tracer, optional
+            Number of qubits to allocate. Omit when *qv* already has a register.
 
         """
-
         if self.abs_qst is None:
             raise RuntimeError(
                 "Tried to create QuantumVariable outside of a quantum tracing "
@@ -232,15 +234,11 @@ class TracingQuantumSession:
 
         self._check_in_scope()
 
-        if size is not None:
-            qv.reg = self.request_qubits(size)
+        qv.bind(self, self.request_qubits(size) if size is not None else None)
+        qv.creation_time = QuantumVariable._next_creation_time()
 
         self.qv_list.append(qv)
-        qv.qs = self
-
         QuantumVariable.live_qvs.append(weakref.ref(qv))
-        qv.creation_time = QuantumVariable.creation_counter
-        QuantumVariable.creation_counter += 1
 
     def request_qubits(self, amount: int | Tracer) -> DynamicQubitArray:
         """Allocate *amount* qubits and return a :class:`~qrisp.jasp.DynamicQubitArray`.

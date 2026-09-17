@@ -152,3 +152,47 @@ def test_prefix_control():
         return q_while_loop(lambda x: jnp.all(x == bi0), lambda x: x + N_outer, bi0)
 
     test5()
+
+
+def test_q_while_loop_result_session_restored():
+    """Regression test: verify session restoration on the loop result post flatten->unflatten sequence."""
+
+    def circuit():
+        qf = QuantumFloat(6)
+
+        def body_fun(val):
+            i, qf = val
+            x(qf[0])
+            i += 1
+            return i, qf
+
+        def cond_fun(val):
+            return val[0] < 3
+
+        i, qf = q_while_loop(cond_fun, body_fun, (0, qf))
+        qf.delete()
+        return i
+
+    make_jaspr(circuit)()
+
+
+def test_q_cond_result_session_restored():
+    """Regression test: verify session restoration on the branch result post flatten->unflatten sequence."""
+
+    def circuit():
+        qbl = QuantumBool()
+        h(qbl)
+        pred = measure(qbl)
+
+        def true_fun(qbl):
+            return qbl
+
+        def false_fun(qbl):
+            qbl.flip()
+            return qbl
+
+        qbl = q_cond(pred, true_fun, false_fun, qbl)
+        qbl.delete()
+        return pred
+
+    make_jaspr(circuit)()

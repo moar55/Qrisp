@@ -228,7 +228,7 @@ class QuantumArray:
             s = self.qtype_size
             reg = self.qb_array[:s]
             qv = self.qtype_template.construct(reg)
-            qv.qs = self.qs
+            qv.bind(self.qs)
             return qv
         else:
             return self.qv_list[0]
@@ -285,8 +285,7 @@ class QuantumArray:
                 # variable and update the qv.reg attribute.
                 qv = copy.copy(self.qtype)
                 s = self.qtype_size
-                qv.reg = self.qb_array[index * s : (index + 1) * s]
-                qv.qs = self.qs
+                qv.bind(self.qs, self.qb_array[index * s : (index + 1) * s])
                 return qv
             else:
                 for i in range(len(key)):

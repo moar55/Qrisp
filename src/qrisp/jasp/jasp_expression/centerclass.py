@@ -1477,7 +1477,7 @@ def make_jaspr(
             # QuantumSession yet — register them now.
             arg_qvs = recursive_qv_search(args)
             for qv in arg_qvs:
-                qs.register_qv(qv, None)
+                qs.register_qv(qv)
 
             try:
                 res = fun(*args, **kwargs)
