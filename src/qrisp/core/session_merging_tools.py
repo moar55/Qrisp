@@ -181,14 +181,14 @@ def merge_sessions_inner(qs_0, qs_1, merge_env_stack_=True):
     # Update qv_list
     while len(qs_1.qv_list):
         qv = qs_1.qv_list.pop()
-        # Patch quantum session attribute
-        qv.qs = qs_0
+        # Patch quantum session attribute.
+        qv.bind(qs_0)
 
         qs_0.qv_list.append(qv)
 
     for qv in qs_1.deleted_qv_list:
         # Patch quantum session attribute
-        qv.qs = qs_0
+        qv.bind(qs_0)
 
     qs_0.deleted_qv_list.extend(qs_1.deleted_qv_list)
 

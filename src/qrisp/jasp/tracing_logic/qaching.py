@@ -241,7 +241,7 @@ def qache_helper(func, jax_kwargs):
 
         flattened_qvs = []
         for qv in arg_qvs:
-            tr_qs.register_qv(qv, None)
+            tr_qs.register_qv(qv)
             flattened_qvs.extend(list(flatten_qv(qv)[0]))
 
         # Execute the function
@@ -333,7 +333,7 @@ def qache_helper(func, jax_kwargs):
         # The unflattening creates a new QuantumVariable object, that is however not yet
         # registered in any QuantumSession. We register these in the current QuantumSession.
         for qv in recursive_qv_search(res):
-            tr_qs.register_qv(qv, None)
+            tr_qs.register_qv(qv)
 
         # Return the result.
         return res

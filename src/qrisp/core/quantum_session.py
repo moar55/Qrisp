@@ -304,38 +304,39 @@ class QuantumSession(QuantumCircuit):
         get_unique_name_generator = (qv.get_unique_name() for _ in itertools.count())
         return (self._find_valid_name(get_unique_name_generator), False)
 
-    def register_qv(self, qv: QuantumVariable, size: int | None = None):
-        """Method to register QuantumVariables
+    def register_qv(self, qv: QuantumVariable, size: int | None = None) -> None:
+        """Register *qv* in this session, allocating *size* qubits if it has none yet.
+
+        Every path that produces a usable QuantumVariable goes through here: construction,
+        duplication, and re-registration of a variable that came back from a JAX pytree
+        boundary.
 
         Parameters
         ----------
         qv : QuantumVariable
-            QuantumVariable to register.
+            The quantum variable to register.
         size : int, optional
-            The amount of qubits to request and assign to ``qv.reg``. If None, no
-            qubits are requested and ``qv.reg`` is left untouched - used when
-            ``qv.reg`` has already been assigned before calling this method (e.g. via
-            :meth:`duplicate <qrisp.QuantumVariable.duplicate>` with an explicit
-            ``qubits`` argument). The default is None.
+            Number of qubits to allocate. Omit when *qv* already has a register.
 
-        Returns
-        -------
-        None.
+        Raises
+        ------
+        QuantumVariableNamingError
+            If a variable of the same name is already registered here.
 
         """
         if not self._is_fresh_name(qv.name):
             raise QuantumVariableNamingError(f"Variable name {qv.name} already exists in quantum session")
 
-        # Hand qubits to quantum variable if size is provided.
-        if size is not None:
-            qv.reg = self.request_qubits(size, name=qv.name)
+        # Bind quantum variable to the current session, and optionally to
+        # newly_requested qubits if size is provided.
+        qv.bind(self, self.request_qubits(size, name=qv.name) if size is not None else None)
 
-        # Register in the list of active quantum variable
+        qv.creation_time = QuantumVariable._next_creation_time()
+
+        # Register in the list of active quantum variables.
         self.qv_list.append(qv)
 
         QuantumVariable.live_qvs.append(weakref.ref(qv))
-        qv.creation_time = QuantumVariable.creation_counter
-        QuantumVariable.creation_counter += 1
 
     def get_qv(self, key):
         for qv in self.qv_list:

@@ -117,7 +117,7 @@ def q_while_loop(cond_fun, body_fun, init_val):
         # The unflattening creates a new QuantumVariable object, that is however not yet
         # registered in any QuantumSession. We register these in the current QuantumSession.
         for qv in recursive_qv_search(val[0]):
-            qs.register_qv(qv, None)
+            qs.register_qv(qv)
         res = body_fun(val[0])
         abs_qst = qs.conclude_tracing()
         return (res, abs_qst)
@@ -140,6 +140,9 @@ def q_while_loop(cond_fun, body_fun, init_val):
             eqn.invars.pop(i + eqn.params["cond_nconsts"])
             body_jaxpr.jaxpr.invars.pop(i)
             eqn.params["body_nconsts"] -= 1
+            # qv lost its session in the flatten/unflatten cycle, re-register it.
+            for qv in recursive_qv_search(while_res[0]):
+                qs.register_qv(qv)
             return while_res[0]
 
     from qrisp import Jaspr
@@ -147,6 +150,9 @@ def q_while_loop(cond_fun, body_fun, init_val):
     eqn.params["body_jaxpr"] = Jaspr.from_cache(body_jaxpr)
 
     qs.abs_qst = while_res[1]
+    # qv lost its session in the flatten/unflatten cycle, re-register it.
+    for qv in recursive_qv_search(while_res[0]):
+        qs.register_qv(qv)
     return while_res[0]
 
 
@@ -238,7 +244,7 @@ def _wrap_branch_for_tracing(fn, qs):
     def wrapped(*operands):
         qs.start_tracing(operands[1])
         for qv in recursive_qv_search(operands[0]):
-            qs.register_qv(qv, None)
+            qs.register_qv(qv)
         res = fn(*operands[0])
         abs_qst = qs.conclude_tracing()
         return (res, abs_qst)
@@ -283,11 +289,18 @@ def _finalize_branch_eqn(eqn, branch_jaxprs, res, qs, fun_name):
         eqn.invars.pop(-1)
         for branch_jaxpr in branch_jaxprs:
             branch_jaxpr.jaxpr.invars.pop(-1)
+        # qv lost its session in the flatten/unflatten cycle, re-register it.
+        for qv in recursive_qv_search(res[0]):
+            qs.register_qv(qv)
         return res[0]
 
     eqn.params["branches"] = tuple(Jaspr.from_cache(branch_jaxpr) for branch_jaxpr in branch_jaxprs)
 
     qs.abs_qst = res[-1]
+
+    # qv lost its session in the flatten/unflatten cycle, re-register it.
+    for qv in recursive_qv_search(res[0]):
+        qs.register_qv(qv)
 
     return res[0]
 

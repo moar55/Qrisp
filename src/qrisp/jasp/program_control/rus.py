@@ -18,10 +18,7 @@
 
 import inspect
 
-from qrisp.jasp import (
-    TracingQuantumSession,
-    qache,
-)
+from qrisp.jasp import TracingQuantumSession, qache
 
 
 def RUS(*trial_function, **jit_kwargs):
@@ -322,9 +319,7 @@ def RUS(*trial_function, **jit_kwargs):
             # from the previous iteration
             qv_results = recursive_qv_search(args[n_arg_vals:])
 
-            tr_qs = TracingQuantumSession.get_instance()
             for qv in qv_results:
-                tr_qs.register_qv(qv, None)
                 reset(qv)
                 qv.delete()
 
