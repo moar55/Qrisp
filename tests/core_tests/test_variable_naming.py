@@ -15,6 +15,9 @@
 ********************************************************************************
 """
 
+from collections import Counter
+from weakref import WeakSet
+
 import pytest
 
 from qrisp import QuantumSession, QuantumVariable, QuantumVariableNamingError
@@ -40,8 +43,8 @@ def _isolated_quantum_variable_naming_state():
     original_name_tracker = QuantumVariable.name_tracker
     original_live_qvs = QuantumVariable.live_qvs
     original_creation_counter = QuantumVariable.creation_counter
-    QuantumVariable.name_tracker = {}
-    QuantumVariable.live_qvs = []
+    QuantumVariable.name_tracker = Counter()
+    QuantumVariable.live_qvs = WeakSet()
     QuantumVariable.creation_counter = 0
     try:
         yield
