@@ -19,8 +19,8 @@
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING, Any, Self
-from weakref import WeakSet
+from typing import TYPE_CHECKING, Any
+from weakref import WeakValueDictionary
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -30,18 +30,17 @@ from collections import Counter
 from qrisp.core.compilation import qompiler
 
 if TYPE_CHECKING:
-    from weakref import WeakSet
     from qrisp.core.quantum_session import QuantumSession
     from qrisp.interface.measurement_result import DecodedMeasurementResult
-    from qrisp.jasp import TracingQuantumSession
+    from qrisp.jasp import TracingQuantumSession, DynamicQubitArray
     from qrisp.circuit import Qubit, QuantumCircuit
-    from numpy.typing import ArrayLike
 
     import jax
 
     from qrisp.interface import BackendLike
 
     from typing import Callable
+    from collections.abc import Hashable
 
 
 def extract_quantum_session(qs: QuantumSession | None) -> QuantumSession | TracingQuantumSession:
@@ -260,7 +259,7 @@ class QuantumVariable:
     is_fixed_name: bool
     reg: Any  # pyright: ignore[reportExplicitAny, reportUninitializedInstanceVariable]
     creation_time: int  # pyright: ignore[reportUninitializedInstanceVariable]
-    live_qvs: WeakSet[QuantumVariable] = WeakSet()
+    live_qvs: WeakValueDictionary[int, QuantumVariable] = WeakValueDictionary()
     creation_counter: int = 0
     name_tracker: Counter[str] = Counter()
     qs: QuantumSession | TracingQuantumSession
@@ -373,7 +372,7 @@ class QuantumVariable:
 
         return and_res
 
-    def __lshift__(self, other: QuantumVariable):
+    def __lshift__(self, other: Callable[[Any], QuantumVariable]):
         if not callable(other):
             raise Exception("Tried to inject QuantumVariable into non-callable")
 
@@ -445,7 +444,7 @@ class QuantumVariable:
             return
 
         self.qs.delete_qv(self, verify)
-        QuantumVariable.live_qvs.discard(self)
+        QuantumVariable.live_qvs.pop(hash(self), None)
 
         if recompute:
             for qb in self.reg:
@@ -588,7 +587,7 @@ class QuantumVariable:
     def jdecoder(self, i):
         return i
 
-    def encoder(self, value: str):
+    def encoder(self, value: Hashable):
         """The encoder reverses the decoder, it turns human-readable values into integers.
 
         If not overloaded, the encoder will perform a linear search on decoder inputs to
@@ -596,7 +595,7 @@ class QuantumVariable:
 
         Parameters
         ----------
-        value : str
+        value : Hashable
             A human-readable label.
 
         Raises
@@ -628,7 +627,7 @@ class QuantumVariable:
 
         raise Exception("Value " + str(value) + " not supported by encoder.")
 
-    def encode(self, value: str, permit_dirtyness=False):
+    def encode(self, value: Hashable, permit_dirtyness=False):
         """The encode method allows to quickly bring a QuantumVariable in a desired
         computational basis state.
 
@@ -639,7 +638,7 @@ class QuantumVariable:
 
         Parameters
         ----------
-        value : str
+        value : Hashable
             A value supported by the encoder.
         permit_dirtyness : bool, optional
             Surpresses the error message when calling encode on dirty qubits.
@@ -865,7 +864,7 @@ class QuantumVariable:
 
         Parameters
         ----------
-        qubits : list, or single qubit
+        qubits : list[Qubit]
             The qubits to remove from the QuantumVariable.
 
         verify : bool
@@ -874,6 +873,9 @@ class QuantumVariable:
 
         Raises
         ------
+        Exception
+            Tried to reduce a QuantumVariable in tracing mode.
+
         Exception
             Qubits not present in QuantumVariable.
 
@@ -893,10 +895,10 @@ class QuantumVariable:
         [Qubit(qv.2), Qubit(qv.3), Qubit(qv.4)]
 
         """
-        try:
-            len(qubits)
-        except TypeError:
-            qubits = [qubits]
+        from qrisp.jasp import TracingQuantumSession
+
+        if isinstance(self.qs, TracingQuantumSession):
+            raise Exception("Tried to reduce a QuantumVariable in tracing mode")
 
         if not set(qubits).issubset(self.reg):
             raise Exception("Tried to reduce QuantumVariable by invalid qubits")
@@ -1098,13 +1100,13 @@ class QuantumVariable:
 
     # Overload equality operator to use python syntax for if environments?
     # Not sure if the possible user confusion is worth it
-    def __eq__(self, other: QuantumVariable):  # pyright: ignore[reportIncompatibleMethodOverride]
+    def __eq__(self, other: QuantumVariable | Hashable):  # pyright: ignore[reportIncompatibleMethodOverride]
         r"""
         Compare self with another QuantumVariable or a classical label against equality (==), returning a QuantumBool.
 
         Parameters
         ----------
-        other : QuantumVariable
+        other : QuantumVariable or Hashable
             A QuantumVariable of the same size, or a classical label of this
             QuantumVariable's type, to compare self with.
 
@@ -1146,13 +1148,13 @@ class QuantumVariable:
 
         return q_eq(self, other)
 
-    def __ne__(self, other: QuantumVariable):  # pyright: ignore[reportIncompatibleMethodOverride]
+    def __ne__(self, other: QuantumVariable | Hashable):  # pyright: ignore[reportIncompatibleMethodOverride]
         r"""
         Compare self with another QuantumVariable or a classical label against inequality (!=), returning a QuantumBool.
 
         Parameters
         ----------
-        other : QuantumVariable
+        other : QuantumVariable or Hashable
             A QuantumVariable of the same size, or a classical label of this
             QuantumVariable's type, to compare self with.
 
@@ -1398,12 +1400,12 @@ class QuantumVariable:
                     name = "qv"
 
         def name_exists():
-            return any(map(lambda qv: qv.name == name, QuantumVariable.live_qvs))
+            return any(map(lambda qv: qv.name == name, QuantumVariable.live_qvs.values()))
 
         augmented = False
         while not augmented or name_exists():
             orig_name = name
-            # Not sure if we want to append new '_'' everytime :thinking:
+            # Not sure if we want to append new '_' everytime
             name = f"{orig_name}_{self.name_tracker[orig_name]}"
             self.name_tracker[orig_name] += 1
             augmented = True

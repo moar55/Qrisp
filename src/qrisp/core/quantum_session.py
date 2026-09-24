@@ -335,7 +335,9 @@ class QuantumSession(QuantumCircuit):
 
         qv.creation_time = QuantumVariable.creation_counter
         QuantumVariable.creation_counter += 1
-        QuantumVariable.live_qvs.add(qv)
+        if hash(qv) in QuantumVariable.live_qvs:
+            raise Exception(f"Tried to register {qv!r}, whose hash collides with a live QuantumVariable")
+        QuantumVariable.live_qvs[hash(qv)] = qv
 
     def get_qv(self, key):
         for qv in self.qv_list:

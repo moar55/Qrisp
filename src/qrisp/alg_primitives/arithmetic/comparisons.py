@@ -89,7 +89,7 @@ def less_than_gate(a, b):
             a.reduce([a[-2]], verify=False)
 
     for i in range(added_qubits_lower):
-        a.reduce(a[0], verify=False)
+        a.reduce([a[0]], verify=False)
         a.exponent += 1
 
     if added_sign:

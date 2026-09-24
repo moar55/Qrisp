@@ -16,7 +16,7 @@
 """
 
 from collections import Counter
-from weakref import WeakSet
+from weakref import WeakValueDictionary
 
 import pytest
 
@@ -44,7 +44,7 @@ def _isolated_quantum_variable_naming_state():
     original_live_qvs = QuantumVariable.live_qvs
     original_creation_counter = QuantumVariable.creation_counter
     QuantumVariable.name_tracker = Counter()
-    QuantumVariable.live_qvs = WeakSet()
+    QuantumVariable.live_qvs = WeakValueDictionary()
     QuantumVariable.creation_counter = 0
     try:
         yield
