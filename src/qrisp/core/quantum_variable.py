@@ -19,19 +19,28 @@
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING, Any, Self
-from weakref import ReferenceType
+from typing import TYPE_CHECKING, Any
+from weakref import WeakValueDictionary
 
 import matplotlib.pyplot as plt
 import numpy as np
 from jax import tree_util
+from collections import Counter
 
 from qrisp.core.compilation import qompiler
 
 if TYPE_CHECKING:
     from qrisp.core.quantum_session import QuantumSession
     from qrisp.interface.measurement_result import DecodedMeasurementResult
-    from qrisp.jasp import TracingQuantumSession
+    from qrisp.jasp import TracingQuantumSession, DynamicQubitArray
+    from qrisp.circuit import Qubit, QuantumCircuit
+
+    import jax
+
+    from qrisp.interface import BackendLike
+
+    from typing import Callable
+    from collections.abc import Hashable
 
 
 def extract_quantum_session(qs: QuantumSession | None) -> QuantumSession | TracingQuantumSession:
@@ -250,9 +259,9 @@ class QuantumVariable:
     is_fixed_name: bool
     reg: Any  # pyright: ignore[reportExplicitAny, reportUninitializedInstanceVariable]
     creation_time: int  # pyright: ignore[reportUninitializedInstanceVariable]
-    live_qvs: list[ReferenceType[Self]] = []
+    live_qvs: WeakValueDictionary[int, QuantumVariable] = WeakValueDictionary()
     creation_counter: int = 0
-    name_tracker: dict[str, int] = {}
+    name_tracker: Counter[str] = Counter()
     qs: QuantumSession | TracingQuantumSession
     static_attributes: list[str]
     traced_attributes: list[str]
@@ -328,10 +337,7 @@ class QuantumVariable:
     def __or__(self, other):
         from qrisp import cx, mcx, x
 
-        if len(self) > len(other):
-            or_res = self.duplicate()
-        else:
-            or_res = other.duplicate()
+        or_res = self.duplicate() if len(self) > len(other) else other.duplicate()
 
         for i in range(min(len(self), len(other))):
             mcx([self[i], other[i]], or_res[i], ctrl_state=0)
@@ -345,26 +351,20 @@ class QuantumVariable:
 
         return or_res
 
-    def __and__(self, other):
+    def __and__(self, other: QuantumVariable):
         from qrisp import mcx
 
-        if len(self) > len(other):
-            and_res = self.duplicate()
-        else:
-            and_res = other.duplicate()
+        and_res = self.duplicate() if len(self) > len(other) else other.duplicate()
 
         for i in range(min(len(self), len(other))):
             mcx([self[i], other[i]], and_res[i])
 
         return and_res
 
-    def __xor__(self, other):
+    def __xor__(self, other: QuantumVariable):
         from qrisp import cx
 
-        if len(self) > len(other):
-            and_res = self.duplicate()
-        else:
-            and_res = other.duplicate()
+        and_res = self.duplicate() if len(self) > len(other) else other.duplicate()
 
         for i in range(min(len(self), len(other))):
             cx(self[i], and_res[i])
@@ -372,7 +372,7 @@ class QuantumVariable:
 
         return and_res
 
-    def __lshift__(self, other):
+    def __lshift__(self, other: Callable[[Any], QuantumVariable]):
         if not callable(other):
             raise Exception("Tried to inject QuantumVariable into non-callable")
 
@@ -444,19 +444,7 @@ class QuantumVariable:
             return
 
         self.qs.delete_qv(self, verify)
-
-        i = 0
-        while i < len(QuantumVariable.live_qvs):
-            live_qv = QuantumVariable.live_qvs[i]()
-            if live_qv is None:
-                del QuantumVariable.live_qvs[i]
-                continue
-
-            if live_qv.name == self.name:
-                del QuantumVariable.live_qvs[i]
-                break
-
-            i += 1
+        QuantumVariable.live_qvs.pop(hash(self), None)
 
         if recompute:
             for qb in self.reg:
@@ -468,7 +456,13 @@ class QuantumVariable:
                 return True
         return False
 
-    def duplicate(self, name: str | None = None, qs=None, init=False, qubits=None):
+    def duplicate(
+        self,
+        name: str | None = None,
+        qs: QuantumSession | None = None,
+        init=False,
+        qubits: list[Qubit] | DynamicQubitArray | None = None,
+    ):
         r"""
         Duplicate a QuantumVariable.
 
@@ -483,6 +477,7 @@ class QuantumVariable:
         qs : QuantumSession, optional
             A QuantumSession, where the result should be registered. If not given, a new
             QuantumSession will be generated.
+            Passing a TracingQuantumSession is ignored gracefully, at run-time.
         init : bool, optional
             If set to True, the :meth:`init_from <qrisp.QuantumVariable.init_from>`
             method of the result will be called on self. The default is False.
@@ -553,7 +548,7 @@ class QuantumVariable:
 
         return duplicate
 
-    def decoder(self, i):
+    def decoder(self, i: int):
         """The decoder method specifies how a QuantumVariable turns the outcomes of
         measurements into human-readable values. It recieves an integer ``i`` and
         returns a human-readable value.
@@ -592,7 +587,7 @@ class QuantumVariable:
     def jdecoder(self, i):
         return i
 
-    def encoder(self, value):
+    def encoder(self, value: Hashable):
         """The encoder reverses the decoder, it turns human-readable values into integers.
 
         If not overloaded, the encoder will perform a linear search on decoder inputs to
@@ -600,8 +595,8 @@ class QuantumVariable:
 
         Parameters
         ----------
-        label :
-            A human-readable value.
+        value : Hashable
+            A human-readable label.
 
         Raises
         ------
@@ -632,7 +627,7 @@ class QuantumVariable:
 
         raise Exception("Value " + str(value) + " not supported by encoder.")
 
-    def encode(self, value, permit_dirtyness=False):
+    def encode(self, value: Hashable, permit_dirtyness=False):
         """The encode method allows to quickly bring a QuantumVariable in a desired
         computational basis state.
 
@@ -643,7 +638,7 @@ class QuantumVariable:
 
         Parameters
         ----------
-        value :
+        value : Hashable
             A value supported by the encoder.
         permit_dirtyness : bool, optional
             Surpresses the error message when calling encode on dirty qubits.
@@ -671,14 +666,16 @@ class QuantumVariable:
         from qrisp.jasp import TracingQuantumSession
         from qrisp.misc import check_if_fresh, int_encoder
 
-        if not isinstance(self.qs, TracingQuantumSession):
-            if not permit_dirtyness:
-                if not check_if_fresh(self.reg, self.qs):
-                    raise Exception("Tried to initialize qubits which are not fresh anymore.")
+        if (
+            not isinstance(self.qs, TracingQuantumSession)
+            and not permit_dirtyness
+            and not check_if_fresh(self.reg, self.qs)
+        ):
+            raise Exception("Tried to initialize qubits which are not fresh anymore.")
 
         int_encoder(self, self.encoder(value))
 
-    def init_state(self, params, method="auto"):
+    def init_state(self, params: dict[str, np.complex128] | jax.Array, method="auto"):
         r"""Initialize an arbitrary quantum state on this quantum variable.
 
         This method supports two input formats:
@@ -803,7 +800,7 @@ class QuantumVariable:
     def append(self, operation):
         self.qs.append(operation, self)
 
-    def extend(self, amount, position=-1):
+    def extend(self, amount: int, position=-1):
         """This method is used to add more qubits to the QuantumVariable. Using the
         position keyword it is possible to specify the position where the qubits should
         be added. By default, the qubits are added at the end.
@@ -861,13 +858,13 @@ class QuantumVariable:
                 )
                 self.reg.insert(position + i, insertion_qubits[i])
 
-    def reduce(self, qubits: Any, verify=False):
+    def reduce(self, qubits: list[Qubit], verify=False):
         r"""Reduces the qubit count of the QuantumVariable by removing a specified set of
         qubits.
 
         Parameters
         ----------
-        qubits : list
+        qubits : list[Qubit]
             The qubits to remove from the QuantumVariable.
 
         verify : bool
@@ -876,6 +873,9 @@ class QuantumVariable:
 
         Raises
         ------
+        Exception
+            Tried to reduce a QuantumVariable in tracing mode.
+
         Exception
             Qubits not present in QuantumVariable.
 
@@ -895,10 +895,10 @@ class QuantumVariable:
         [Qubit(qv.2), Qubit(qv.3), Qubit(qv.4)]
 
         """
-        try:
-            len(qubits)
-        except TypeError:
-            qubits = [qubits]
+        from qrisp.jasp import TracingQuantumSession
+
+        if isinstance(self.qs, TracingQuantumSession):
+            raise Exception("Tried to reduce a QuantumVariable in tracing mode")
 
         if not set(qubits).issubset(self.reg):
             raise Exception("Tried to reduce QuantumVariable by invalid qubits")
@@ -918,14 +918,14 @@ class QuantumVariable:
     def get_measurement(
         self,
         plot=False,
-        backend=None,
-        shots=None,
+        backend: BackendLike | None = None,
+        shots: int | None = None,
         compile=True,
         compilation_kwargs={},
         subs_dic={},
-        circuit_preprocessor=None,
-        filename=None,
-        precompiled_qc=None,
+        circuit_preprocessor: Callable[[QuantumCircuit], QuantumCircuit] | None = None,
+        filename: str | None = None,
+        precompiled_qc: QuantumCircuit | None = None,
     ) -> "DecodedMeasurementResult":
         r"""
         Get the measurement results of the state of the variable.
@@ -959,6 +959,8 @@ class QuantumVariable:
             after compilation and parameter substitution. The default is None.
         filename : string, optional
             The location of where to save a generated plot. The default is None.
+        precompiled_qc : QuantumCircuit, optional
+            A precompiled quantum circuit.
 
         Raises
         ------
@@ -996,13 +998,11 @@ class QuantumVariable:
         if isinstance(self.qs, TracingQuantumSession):
             raise Exception("Tried to get measurement of a QuantumVariable in tracing mode")
 
-        if backend is None:
-            if self.qs.backend is None:
-                from qrisp.default_backend import def_backend
+        from qrisp.default_backend import def_backend
 
-                backend = def_backend
-            else:
-                backend = self.qs.backend
+        concrete_backend = (
+            backend if backend is not None else (def_backend if self.qs.backend is None else self.qs.backend)
+        )
 
         if len(self.qs.env_stack) != 0:
             raise Exception("Tried to get measurement within open environment")
@@ -1014,13 +1014,13 @@ class QuantumVariable:
             # TODO: Create a const DecodedMeasurmentResult that describes this construct.
             return {"": 1.0}  # pyright: ignore[reportReturnType]
 
-        if precompiled_qc is None:
-            if compile:
-                qc = qompiler(self.qs, intended_measurements=self.reg, **compilation_kwargs)
-            else:
-                qc = self.qs.copy()
-        else:
-            qc = precompiled_qc.copy()
+        qc = (
+            precompiled_qc.copy()
+            if precompiled_qc is not None
+            else (
+                qompiler(self.qs, intended_measurements=self.reg, **compilation_kwargs) if compile else self.qs.copy()
+            )
+        )
 
         # Bind parameters
         if subs_dic:
@@ -1029,23 +1029,14 @@ class QuantumVariable:
 
             qc = combine_single_qubit_gates(qc)
 
-        # Copy circuit in over to prevent modification
-        # from qrisp.quantum_network import QuantumNetworkClient
-
-        # if isinstance(backend, QuantumNetworkClient):
-        #     self.qs.data = []
-        #     shots = 1
-
         # Execute user specified circuit_preprocessor
         if circuit_preprocessor is not None:
             qc = circuit_preprocessor(qc)
 
-        # qc = qc.transpile()
-
         from qrisp.interface.measurement_result import DecodedMeasurementResult
         from qrisp.misc import get_measurement_from_qc
 
-        counts = get_measurement_from_qc(qc, self.reg, backend, shots)
+        counts = get_measurement_from_qc(qc, self.reg, concrete_backend, shots)
         result = DecodedMeasurementResult(counts, self.decoder)
 
         if plot:
@@ -1086,29 +1077,16 @@ class QuantumVariable:
     def __getitem__(self, key):
         return self.reg[key]
 
+    def __repr__(self):
+        return "<" + str(type(self)).split(".")[-1][:-2] + " '" + self.name + "'>"
+        # QUESTION: Are these still needed?
+        # return str(type(self)).split(".")[-1][:-2] + "(name = " + self.name + ")"
+        # return str(self)
+
     def __str__(self):
         from qrisp.jasp import check_for_tracing_mode
 
-        if check_for_tracing_mode():
-            return self.__repr__()
-        else:
-            return str(self.get_measurement())
-
-    def __repr__(self):
-        return "<" + str(type(self)).split(".")[-1][:-2] + " '" + self.name + "'>"
-        return str(type(self)).split(".")[-1][:-2] + "(name = " + self.name + ")"
-        return str(self)
-
-    def __del__(self):
-        i = 0
-        while i < len(self.live_qvs):
-            if self.live_qvs[i]() is None or id(self) == id(self.live_qvs[i]()):
-                self.live_qvs.pop(i)
-                continue
-            i += 1
-
-    def __len__(self):
-        return self.size
+        return repr(self) if check_for_tracing_mode() else str(self.get_measurement())
 
     @property
     def size(self):
@@ -1117,15 +1095,18 @@ class QuantumVariable:
         else:
             return self.reg.size
 
+    def __len__(self):
+        return self.size
+
     # Overload equality operator to use python syntax for if environments?
     # Not sure if the possible user confusion is worth it
-    def __eq__(self, other):  # pyright: ignore[reportIncompatibleMethodOverride]
+    def __eq__(self, other: QuantumVariable | Hashable):  # pyright: ignore[reportIncompatibleMethodOverride]
         r"""
         Compare self with another QuantumVariable or a classical label against equality (==), returning a QuantumBool.
 
         Parameters
         ----------
-        other : QuantumVariable
+        other : QuantumVariable or Hashable
             A QuantumVariable of the same size, or a classical label of this
             QuantumVariable's type, to compare self with.
 
@@ -1167,13 +1148,13 @@ class QuantumVariable:
 
         return q_eq(self, other)
 
-    def __ne__(self, other):  # pyright: ignore[reportIncompatibleMethodOverride]
+    def __ne__(self, other: QuantumVariable | Hashable):  # pyright: ignore[reportIncompatibleMethodOverride]
         r"""
         Compare self with another QuantumVariable or a classical label against inequality (!=), returning a QuantumBool.
 
         Parameters
         ----------
-        other : QuantumVariable
+        other : QuantumVariable or Hashable
             A QuantumVariable of the same size, or a classical label of this
             QuantumVariable's type, to compare self with.
 
@@ -1222,7 +1203,7 @@ class QuantumVariable:
         if key != slice(None, None, None):
             raise Exception("Tried to encode value into QuantumVariable using non-trivial slicing.")
 
-        if isinstance(type(value), type(None)):
+        if value is None:
             return
 
         if isinstance(value, dict):
@@ -1235,7 +1216,7 @@ class QuantumVariable:
 
         self.encode(value)
 
-    def app_phase_function(self, phi):
+    def app_phase_function(self, phi: Callable[[str], float]):
         r"""Applies a previously specified phase function to each computational basis state
         of the QuantumVariable using Gray-Synthesis.
 
@@ -1404,39 +1385,30 @@ class QuantumVariable:
         else:
             self.qs.uncomp_stack.append(self)
 
-    def get_unique_name(self, name=None):
+    def get_unique_name(self, name: str | None = None):
         if name is None:
             from qrisp import QuantumBool, QuantumChar, QuantumFloat
 
-            if isinstance(self, QuantumBool):
-                name = "qbl"
-            elif isinstance(self, QuantumFloat):
-                name = "qf"
-            elif isinstance(self, QuantumChar):
-                name = "qch"
-            else:
-                name = "qv"
+            match self:
+                case QuantumBool():
+                    name = "qbl"
+                case QuantumFloat():
+                    name = "qf"
+                case QuantumChar():
+                    name = "qch"
+                case _:
+                    name = "qv"
 
-        while True:
-            try:
-                naming_number = self.name_tracker[name]
-                self.name_tracker[name] += 1
-                name = name + "_" + str(naming_number)
-            except KeyError:
-                self.name_tracker[name] = 1
-                name = name + "_0"
+        def name_exists():
+            return any(map(lambda qv: qv.name == name, QuantumVariable.live_qvs.values()))
 
-            i = 0
-            while i < len(QuantumVariable.live_qvs):
-                qv = QuantumVariable.live_qvs[i]()
-                if qv is None:
-                    QuantumVariable.live_qvs.pop(i)
-                    continue
-                if qv.name == name:
-                    break
-                i += 1
-            else:
-                break
+        augmented = False
+        while not augmented or name_exists():
+            orig_name = name
+            # Not sure if we want to append new '_' everytime
+            name = f"{orig_name}_{self.name_tracker[orig_name]}"
+            self.name_tracker[orig_name] += 1
+            augmented = True
 
         return name
 
@@ -1446,7 +1418,7 @@ class QuantumVariable:
         else:
             return self.reg.__iter__()
 
-    def init_from(self, other):
+    def init_from(self, other: QuantumVariable):
         r"""Initializes a QuantumVariable based on the state of another.
 
         It does NOT copy the state. Much rather it performs the operation
@@ -1529,7 +1501,7 @@ class QuantumVariable:
         self.qs.cx(other.reg, self.reg)
 
     @classmethod
-    def custom(cls, label_list, decoder=None, qs=None, name=None):
+    def custom(cls, label_list: list[Any], decoder=None, qs=None, name=None):
         """Creates a QuantumVariable with customized outcome labels.
 
         Note that this is a class method, implying there is no need to create another
@@ -1584,13 +1556,13 @@ class QuantumVariable:
         return QuantumVariableTemplate(self)
 
 
-def plot_histogram(outcome_labels, counts, filename=None):
+def plot_histogram(outcome_labels: list[str], counts: dict[Any, float], filename=None):
     res_list = []
 
     for k in range(len(outcome_labels)):
-        try:
-            res_list.append(counts[outcome_labels[k]])
-        except KeyError:
+        if (count := counts.get(outcome_labels[k])) is not None:
+            res_list.append(count)
+        else:
             res_list.append(0)
 
     plt.bar(outcome_labels, res_list, width=0.8)
